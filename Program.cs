@@ -10,7 +10,7 @@ using Recompiled;
 
 Verdite.Core.Game.Configure(tag: "KF2");
 
-// Runs nobody watches: no window, no GL context, no audio device (runtime 0111),
+// Runs nobody watches: no window, no GL context, no audio device (runtime 0112),
 // and a world that ticks every frame with nothing waiting (FramePacing.Turbo).
 // The fuzzer's two switches; see "Fuzzing headless playthroughs" in
 // docs/DEVELOPMENT.md.
@@ -649,6 +649,28 @@ Kf2.WallGuard.Install();
 Kf2.HeapGuard.Configure(Environment.GetEnvironmentVariable("KF2_HEAPGUARD"));
 Kf2.HeapGuard.Install();
 
+// A walked crossing's loader reads each part of the next area into one buffer and
+// copies it out on its next call; the texture loader reads into the same buffer.
+// With every read instant, the disc queue could retire a picture's read over the
+// area's objects before the loader copied them (a crash entering fdat08). The guard
+// keeps the buffer when a loader read retires and puts it back before the step that
+// reads it. See "A walked crossing's objects came from a texture" in
+// docs/GAME_INTERNALS.md.
+//
+//     KF2_STREAMGUARD=0   the recompiled loader alone -- comparison only
+Kf2.StreamGuard.Configure(Environment.GetEnvironmentVariable("KF2_STREAMGUARD"));
+Kf2.StreamGuard.Install();
+
+// The class of fault behind it: the port's drive finishes a read at once and a
+// hitch can deliver several vblanks in one frame, so two reads can land on the same
+// RAM before the one that read first has copied it out, which the console's drive
+// never allowed. This reports each such read (a fuzz violation, disc-race) unless a
+// guard repairs it; DiscRace.DeferredConsumers lists who copies out late.
+//
+//     KF2_DISCRACE=0      no report
+Kf2.DiscRace.Configure(Environment.GetEnvironmentVariable("KF2_DISCRACE"));
+Kf2.DiscRace.Install();
+
 // Dithering. Clearing the GPU's dither bit is one pre/post hook pair on each of
 // PutDrawEnv and DrawOTag, and it is a patch rather than a mod because it is a
 // picture the port should be able to offer without a package having to load: the
@@ -1037,6 +1059,18 @@ RecompOne.Runtime.Hle.GlVram.SnapshotProbe =
 if (!RecompOne.Runtime.Hle.GlVram.Snapshots)
     Console.WriteLine("[KF2] vram snapshots: off (a menu restores the frame at 1x)");
 
+// The runtime's box downsample (0129). Its saved key is read when the window comes
+// up, which is before the runtime is ready, so the run's override goes on after:
+//
+//     KF2_DOWNSAMPLE=1      the scaled picture averaged back to 240 lines
+//     KF2_DOWNSAMPLE=0      the scaled picture as it is
+if (Environment.GetEnvironmentVariable("KF2_DOWNSAMPLE") is { Length: > 0 } downsample)
+    RecompOne.Runtime.Events.Event.AddListener<RecompOne.Runtime.Events.RuntimeReadyEvent>(_ =>
+        RecompOne.Runtime.Hle.GlVram.Downsample = downsample.Trim() != "0");
+if (Environment.GetEnvironmentVariable("KF2_CRT") is { Length: > 0 } crt)
+    RecompOne.Runtime.Events.Event.AddListener<RecompOne.Runtime.Events.RuntimeReadyEvent>(_ =>
+        RecompOne.Runtime.Hle.GlVram.Crt = crt.Trim() != "0");
+
 // Which vblank timeline VSync runs on. Upstream grew its own after the pin this
 // port was vendored from: Interrupts owns a wall-clock grid and VSync *blocks*
 // in WaitVBlanks until the count reaches its target, which is what the hardware
@@ -1079,7 +1113,8 @@ Kf2.AutoReload.Install();
 // switches (KF2_MAP*) read only with the mod enabled; docs/ENV_VARS.md has them.
 
 // M, or the touchpad, opens the game's own map item (PIRATE'S, MINER'S or NECRON'S
-// MAP) through the ITEM page's viewer, as using it there does. Off with KF2_MAPKEY=0;
+// MAP) through the ITEM page's viewer, as using it there does. Unbound here, because
+// the map mod uses the touchpad. On again with KF2_MAPKEY=1;
 // KF2_MAPKEY_TEST=<seconds> opens it that many seconds into the first area. See
 // "The maps" in docs/GAME_INTERNALS.md.
 Kf2.MapKey.Configure(Environment.GetEnvironmentVariable("KF2_MAPKEY"),
@@ -1285,8 +1320,12 @@ Kf2.CursorMemory.Install();
 //
 //     KF2_SHORTCUTS=0|1       off or on for the run
 //     KF2_SHORTCUTS_PROBE=1   a line for each assignment, shortcut fired and card load
+//     KF2_SHORTCUTS_FADE=0|1  the hands cross fades when idle (on), or stays solid
+//     KF2_SHORTCUTS_REFUSE=<hex>[,<hex>]  the refusal's sound id and volume (12,30)
 Kf2.Shortcuts.Shortcuts.Configure(Environment.GetEnvironmentVariable("KF2_SHORTCUTS"),
-                                  Environment.GetEnvironmentVariable("KF2_SHORTCUTS_PROBE"));
+                                  Environment.GetEnvironmentVariable("KF2_SHORTCUTS_PROBE"),
+                                  Environment.GetEnvironmentVariable("KF2_SHORTCUTS_FADE"),
+                                  Environment.GetEnvironmentVariable("KF2_SHORTCUTS_REFUSE"));
 Kf2.Shortcuts.Shortcuts.Install();
 
 // NPC conversations as King's Field III's: while an NPC's line is up, Interact

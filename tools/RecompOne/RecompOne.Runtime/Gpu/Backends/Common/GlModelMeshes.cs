@@ -295,6 +295,7 @@ public sealed partial class GlCore
             if (_uwModelSky >= 0) _gl.Uniform1(_uwModelSky, 0);
             if (_uwModelTile >= 0) _gl.Uniform1(_uwModelTile, 0);
             if (_uwMipIndirect >= 0) _gl.Uniform1(_uwMipIndirect, 0);
+            if (_uwDepthScale >= 0) _gl.Uniform1(_uwDepthScale, 1f);
             _gl.Uniform1(_uwModel, 0);
         }
         else
@@ -345,6 +346,7 @@ public sealed partial class GlCore
             return;
         }
         _gl.Uniform1(_uwModelBase, m.VertBase);
+        if (_uwDepthPull >= 0) _gl.Uniform1(_uwDepthPull, _pullOn ? m.DepthPull / 65536f : 0f);
         if (_uwModelSky >= 0) _gl.Uniform1(_uwModelSky, m.Sky ? 1 : 0);
         if (_uwModelTile >= 0) _gl.Uniform1(_uwModelTile, m.Tile ? 1 : 0);
         if (_uwModelClip >= 0) _gl.Uniform1(_uwModelClip, RetainedScene.ModelNearClip ? 1 : 0);
@@ -361,6 +363,8 @@ public sealed partial class GlCore
         if (_uwModelRgbc >= 0) _gl.Uniform1(_uwModelRgbc, m.Rgbc);
         if (_uwModelMat >= 0) _gl.Uniform1(_uwModelMat, m.Material);
         if (_uwModelKeep >= 0) _gl.Uniform1(_uwModelKeep, 1f - Math.Clamp(m.FadeOut, 0f, 1f));
+        if (_uwDepthScale >= 0) _gl.Uniform1(_uwDepthScale, m.Front ? FrontScale : 1f);
+        if (_uwOtzBury >= 0) _gl.Uniform1(_uwOtzBury, RetainedScene.Bury && !m.Door ? OtzBury : 0f);
         if (_uwBk >= 0) _gl.Uniform3(_uwBk, m.Bk0, m.Bk1, m.Bk2);
         if (_uwLcmR >= 0) _gl.Uniform3(_uwLcmR, m.L0, m.L1, m.L2);
         if (_uwLcmG >= 0) _gl.Uniform3(_uwLcmG, m.L3, m.L4, m.L5);
@@ -371,46 +375,86 @@ public sealed partial class GlCore
     /// A view's instances after the map, as <see cref="DrawWorldModels"/> draws the
     /// captured models: 0051's true depth first with colour off, then colour against
     /// it pulled towards the camera. Not culled by GL: the shader keeps the faces the
-    /// lit assembler keeps.
+    /// lit assembler keeps. With 0116's allowances (<see cref="PullsAgainstMap"/>) both
+    /// passes are pulled by each instance's own, and the true depth is put back after.
     /// </summary>
     void DrawInstances(List<RetainedScene.ModelInstance> list, int slot)
+    {
+        int front = 0;
+        for (int i = 0; i < list.Count; i++) if (list[i].Front) front++;
+        if (front > 0)
+        {
+            if (front < list.Count)
+            {
+                var back = new List<RetainedScene.ModelInstance>(list.Count - front);
+                for (int i = 0; i < list.Count; i++) if (!list[i].Front) back.Add(list[i]);
+                DrawInstancesBody(back, slot);
+            }
+            var tops = front == list.Count ? list : new List<RetainedScene.ModelInstance>(front);
+            if (front < list.Count)
+                for (int i = 0; i < list.Count; i++) if (list[i].Front) tops.Add(list[i]);
+            DrawInFront(tops, slot);
+            return;
+        }
+        DrawInstancesBody(list, slot);
+    }
+
+    /// <summary>The share of its view depth a front instance is written at: nearer than
+    /// the chest it hangs over, and past the nearest thing the eye can see.</summary>
+    const float FrontScale = 0.5f;
+
+    /// <summary>A model the table put in front of the world. Depth-tested, the chest
+    /// it was sitting on eats it, because that chest is closer to the eye. Forcing
+    /// the test to pass fixed that, and painted the grip over the board on every
+    /// side: the faces no longer hid one another, so the handle stayed on the front
+    /// while the board turned. Scaling the depth toward the eye keeps the whole item
+    /// in front of the chest, and the faces depth-test against each other, so the
+    /// grip is the near side when the turn brings it round. The occlusion pass then
+    /// reads the item, not the chest under it. The pull is a scale, not an offset: a
+    /// held item is so near the eye that an offset of any use clamps every face to
+    /// depth 0, they tie, and the last one drawn (the board) hides the grip.</summary>
+    void DrawInFront(List<RetainedScene.ModelInstance> list, int slot)
+    {
+        _gl.Disable(EnableCap.CullFace);
+        BeginInstances(slot, true);
+        if (_uwDepthBias >= 0) _gl.Uniform1(_uwDepthBias, 0f);
+        if (_uwDepthSlope >= 0) _gl.Uniform1(_uwDepthSlope, 0f);
+        if (_uwDepthScale >= 0) _gl.Uniform1(_uwDepthScale, FrontScale);
+        _gl.DepthFunc(DepthFunction.Lequal);
+        _gl.DepthMask(true);
+        foreach (var m in list)
+        {
+            if (m.MeshGen != _meshGen || m.MeshCount <= 0) continue;
+            SendInstance(m, true);
+            _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
+            RetainedScene.InstanceCorners += m.MeshCount;
+        }
+        if (_uwDepthScale >= 0) _gl.Uniform1(_uwDepthScale, 1f);
+        EndInstances(true);
+    }
+
+    void DrawInstancesBody(List<RetainedScene.ModelInstance> list, int slot)
     {
         _gl.Disable(EnableCap.CullFace);
         BeginInstances(slot, true);
         bool bias = GteDepth.ZBuffer && (GteDepth.DepthBias > 0f || GteDepth.DepthSlope > 0f);
-        ProbeModelsUnderMap(() =>
-        {
-            foreach (var m in list)
-            {
-                if (m.MeshGen != _meshGen) continue;
-                SendInstance(m, true);
-                _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
-            }
-        });
+        bool pull = bias && PullsAgainstMap(list);
+        _pullProbe = pull;
+        ProbeModelsUnderMap(() => DrawEach(list));
+        _pullProbe = false;
+        _pullOn = pull;
         if (bias)
         {
+            if (pull) MarkPulled();
             DepthOnly(true);
-            foreach (var m in list)
-            {
-                if (m.MeshGen != _meshGen) continue;
-                SendInstance(m, true);
-                _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
-            }
+            DrawEach(list);
             DepthOnly(false);
+            if (pull) EndStencil();
             _gl.DepthMask(false);
             if (_uwDepthBias >= 0) _gl.Uniform1(_uwDepthBias, GteDepth.DepthBias / 65536f);
             if (_uwDepthSlope >= 0) _gl.Uniform1(_uwDepthSlope, GteDepth.DepthSlope);
         }
-        if (bias)
-            ProbeTolerance(2, () =>
-            {
-                foreach (var m in list)
-                {
-                    if (m.MeshGen != _meshGen) continue;
-                    SendInstance(m, true);
-                    _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
-                }
-            });
+        if (bias) ProbeTolerance(2, () => DrawEach(list));
         MarkModels(true);
         foreach (var m in list)
         {
@@ -427,7 +471,85 @@ public sealed partial class GlCore
             if (_uwDepthSlope >= 0) _gl.Uniform1(_uwDepthSlope, 0f);
             _gl.DepthMask(true);
         }
+        _pullOn = false;
+        if (pull) RestoreTrueDepth(list);
+        if (_uwDepthPull >= 0) _gl.Uniform1(_uwDepthPull, 0f);
         EndInstances(true);
+    }
+
+    /// <summary>Each current instance through the bound program, its uniforms sent.</summary>
+    void DrawEach(List<RetainedScene.ModelInstance> list)
+    {
+        foreach (var m in list)
+        {
+            if (m.MeshGen != _meshGen) continue;
+            SendInstance(m, true);
+            _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
+        }
+    }
+
+    // 0116. The main view's instances are drawing (the display target, whose stencil
+    // 0086 already uses; the planar mirror's is not relied on), the instance uniforms
+    // carry their allowance, and the mask probe counts what it brings back.
+    bool _pullAllowed, _pullOn, _pullProbe;
+
+    /// <summary>0116. The stencil bit that marks where a pulled instance passed.
+    /// 0086's model mask is bit 0.</summary>
+    const int PulledBit = 2;
+
+    bool PullsAgainstMap(List<RetainedScene.ModelInstance> list)
+    {
+        if (_uwFarPlane < 0) _uwFarPlane = _gl.GetUniformLocation(_progWorld, "uFarPlane");
+        if (!_pullAllowed || _uwDepthPull < 0 || _uwFarPlane < 0) return false;
+        foreach (var m in list)
+            if (m.DepthPull > 0f && m.MeshGen == _meshGen) return true;
+        return false;
+    }
+
+    /// <summary>0116. The pulled bit cleared, then set by the depth pass where an
+    /// instance passes against the map.</summary>
+    void MarkPulled()
+    {
+        bool scissor = _gl.IsEnabled(EnableCap.ScissorTest);
+        _gl.Disable(EnableCap.ScissorTest);
+        _gl.StencilMask(PulledBit);
+        _gl.ClearStencil(0);
+        _gl.Clear(ClearBufferMask.StencilBufferBit);
+        if (scissor) _gl.Enable(EnableCap.ScissorTest);
+        _gl.Enable(EnableCap.StencilTest);
+        _gl.StencilFunc(StencilFunction.Always, PulledBit, PulledBit);
+        _gl.StencilOp(StencilOp.Keep, StencilOp.Keep, StencilOp.Replace);
+    }
+
+    void EndStencil()
+    {
+        _gl.StencilOp(StencilOp.Keep, StencilOp.Keep, StencilOp.Keep);
+        _gl.StencilMask(0xFF);
+        _gl.Disable(EnableCap.StencilTest);
+    }
+
+    /// <summary>
+    /// 0116. The pulled depth the instances left, replaced by their true depth, so what
+    /// draws after them (water, blended faces, packets) is tested against where they
+    /// are: under the marked pixels, the depth set to the far plane through the
+    /// instances' own coverage, then their true depth drawn into it. The map's depth
+    /// there is given up, which the instance in front of it already hid.
+    /// </summary>
+    void RestoreTrueDepth(List<RetainedScene.ModelInstance> list)
+    {
+        _gl.Enable(EnableCap.StencilTest);
+        _gl.StencilMask(0);
+        _gl.StencilFunc(StencilFunction.Equal, PulledBit, PulledBit);
+        _gl.DepthMask(true);
+        DepthOnly(true);
+        _gl.DepthFunc(DepthFunction.Always);
+        _gl.Uniform1(_uwFarPlane, 1);
+        DrawEach(list);
+        _gl.Uniform1(_uwFarPlane, 0);
+        _gl.DepthFunc(DepthFunction.Lequal);
+        DrawEach(list);
+        DepthOnly(false);
+        EndStencil();
     }
 
     int _uwFarPlane = -1;
@@ -594,7 +716,9 @@ public sealed partial class GlCore
         _gl.DepthMask(true);
         _gl.DepthFunc(DepthFunction.Always);
         _gl.Uniform1(_uwFarPlane, 1);
+        if (f.ArmH > 0f) ArmProjection(f.ArmH, f);
         _gl.DrawElements(PrimitiveType.Triangles, (uint)(to - from), DrawElementsType.UnsignedInt, (void*)(from * 4L));
+        if (f.ArmH > 0f) ArmProjection(f.View.H, f);
         _gl.Uniform1(_uwFarPlane, 0);
         _gl.DepthFunc(DepthFunction.Lequal);
         _gl.BindBuffer(BufferTargetARB.ElementArrayBuffer, 0);
@@ -616,6 +740,15 @@ public sealed partial class GlCore
         return last < f.ArmRuns;
     }
 
+    /// <summary>The world program's projection for the arm's own H, and back to the
+    /// frame's: the screen placement, the depth cue's H and the fog from depth.</summary>
+    void ArmProjection(float h, RetainedScene.Frame f)
+    {
+        if (_uwH >= 0) _gl.Uniform1(_uwH, h);
+        if (_uwCueH >= 0) _gl.Uniform1(_uwCueH, Math.Max(1f, h));
+        if (_uwCueFromZ >= 0) _gl.Uniform1(_uwCueFromZ, RetainedScene.MainFogFromZ ? Math.Max(1f, h) : 0f);
+    }
+
     /// <summary>The arm into the normal and surface buffers as an overlay, at its place
     /// in the list: the surface under it is then no surface for the passes, as its
     /// packets made it, and nothing is murked or reflected over it.</summary>
@@ -631,7 +764,17 @@ public sealed partial class GlCore
         var m = f.Arm;
         m.Material = SurfaceMaterial.Overlay;
         SendInstance(m, false);
+        if (f.ArmH > 0f)
+        {
+            if (_uwnH >= 0) _gl.Uniform1(_uwnH, f.ArmH);
+            if (_uwnProjH >= 0) _gl.Uniform1(_uwnProjH, f.ArmH);
+        }
         _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
+        if (f.ArmH > 0f)
+        {
+            if (_uwnH >= 0) _gl.Uniform1(_uwnH, f.View.H);
+            if (_uwnProjH >= 0) _gl.Uniform1(_uwnProjH, Math.Max(1f, f.View.H));
+        }
         EndInstances(false);
         if (_uwnDepthCull >= 0) _gl.Uniform1(_uwnDepthCull, 1);
     }
@@ -643,11 +786,30 @@ public sealed partial class GlCore
         int slot = f.Serial & (ModelRing - 1);
         if (f.Instances.Count == 0 || _uwnModel < 0 || _mvSerial[slot] != f.Serial || _mvGen[slot] != _meshGen) return;
         BeginInstances(slot, false);
+        bool front = false;
         foreach (var m in f.Instances)
         {
             if (m.MeshGen != _meshGen) continue;
+            // A picked-up item is drawn over the chest. Its own plane would be the
+            // chest's, because the hold keeps the chest's depth, and the passes
+            // would then murk and reflect the chest through the item. An overlay
+            // covers whatever is under it, as the arm does.
+            if (m.Front) { front = true; continue; }
             SendInstance(m, false);
             _gl.DrawArrays(PrimitiveType.Triangles, m.MeshStart, (uint)m.MeshCount);
+        }
+        if (front)
+        {
+            if (_uwnDepthCull >= 0) _gl.Uniform1(_uwnDepthCull, 0);
+            foreach (var m in f.Instances)
+            {
+                if (!m.Front || m.MeshGen != _meshGen) continue;
+                var o = m;
+                o.Material = SurfaceMaterial.Overlay;
+                SendInstance(o, false);
+                _gl.DrawArrays(PrimitiveType.Triangles, o.MeshStart, (uint)o.MeshCount);
+            }
+            if (_uwnDepthCull >= 0) _gl.Uniform1(_uwnDepthCull, 1);
         }
         EndInstances(false);
     }

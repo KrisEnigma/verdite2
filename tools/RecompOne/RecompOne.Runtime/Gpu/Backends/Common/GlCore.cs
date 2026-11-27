@@ -110,6 +110,14 @@ public sealed partial class GlCore : IGpuBackend
     int _lightNSent = -1, _lightsSentGen = -1, _kRemasterGen;
 
     uint _postProg, _postFbo, _postTex;
+    // 0129. The downsample's two programs and its two targets: the game's own
+    // pixels, and the size the Output panel draws the picture at.
+    uint _dsBoxProg, _dsUpProg, _dsBoxTex, _dsBoxFbo, _dsUpTex, _dsUpFbo;
+    int _uDsFactor = -1, _uDsSrcSize = -1, _uDsOutSize = -1;
+    uint _dsCrtProg;
+    int _uCrtSrcSize = -1, _uCrtOutSize = -1;
+    int _dsBoxW, _dsBoxH, _dsUpW, _dsUpH;
+    bool _dsFailed;
     int _postW, _postH, _postVersion = -1;
     int _uPostTexSize, _uPostOutputSize, _uPostTime, _uPostFrame;
     int _postFrame, _postParamVersion = -1;
@@ -148,6 +156,7 @@ public sealed partial class GlCore : IGpuBackend
     bool _kTransparent;
     int _kImage = -1;
     int _kBlend, _kSetMask, _kCheckMask;
+    byte _kOpacity;                                  // 0126; 0 none
     int _kZMode;
     // 0048. The BK/LCM generation the batch's directional triangles were lit with; -1 none.
     int _kLightGen = -1;
@@ -783,7 +792,7 @@ public sealed partial class GlCore : IGpuBackend
                                         || _kRepScroll != _pendingRepScroll)))
             return FlushReason.StateReplacement;
         if (_kTransparent != transparent) return FlushReason.StateSemi;
-        if (_kBlend != blend) return FlushReason.StateBlend;
+        if (_kBlend != blend || _kOpacity != _pendingOpacity) return FlushReason.StateBlend;
         if (_kImage != image) return FlushReason.StateImage;
         if (_kZMode != zMode) return FlushReason.StateDepthMode;
         if (_kSetMask != (_env.SetMask ? 1 : 0) || _kCheckMask != (_env.CheckMask ? 1 : 0)) return FlushReason.StateMask;
@@ -801,7 +810,7 @@ public sealed partial class GlCore : IGpuBackend
                                         && _kRepW == _pendingRepW && _kRepH == _pendingRepH
                                         && _kRepScroll == _pendingRepScroll))
             && _kTransparent == transparent && _kBlend == blend && _kImage == image
-            && _kZMode == zMode
+            && _kOpacity == _pendingOpacity && _kZMode == zMode
             && _kSetMask == (_env.SetMask ? 1 : 0) && _kCheckMask == (_env.CheckMask ? 1 : 0)
             && _kTwAndX == twAndX && _kTwAndY == twAndY && _kTwOrX == twOrX && _kTwOrY == twOrY
             && _kClipX0 == _env.ClipX0 && _kClipY0 == _env.ClipY0 && _kClipX1 == _env.ClipX1 && _kClipY1 == _env.ClipY1;
@@ -812,6 +821,7 @@ public sealed partial class GlCore : IGpuBackend
         bool transparent = f.SemiTrans;
         int blend = f.BlendMode;
         int image = f.UseImage ? f.Image : -1;
+        _pendingOpacity = f.Opacity;
         var target = Classify();
         if (_count > 0)
         {
@@ -825,6 +835,7 @@ public sealed partial class GlCore : IGpuBackend
         _kTarget = target;
         _kImage = image;
         _kTransparent = transparent; _kBlend = blend;
+        _kOpacity = _pendingOpacity;
         _kZMode = zMode;
         _kSetMask = _env.SetMask ? 1 : 0; _kCheckMask = _env.CheckMask ? 1 : 0;
         _kTwAndX = ~(_env.TwMaskX * 8) & 0xFF; _kTwAndY = ~(_env.TwMaskY * 8) & 0xFF;
@@ -835,6 +846,7 @@ public sealed partial class GlCore : IGpuBackend
         _kRepScroll = _pendingRepScroll;
     }
 
+    byte _pendingOpacity;
     uint _pendingRepTex, _pendingRepClut;
     int _pendingRepClutCount = 16;
     float _pendingRepX, _pendingRepY, _pendingRepW = 1, _pendingRepH = 1, _pendingRepScroll = -1;
@@ -1063,7 +1075,7 @@ public sealed partial class GlCore : IGpuBackend
                 m = zMode == 2 ? SurfaceMaterial.None : SurfaceMaterial.Opaque;
                 if (GteDepth.Reflections)
                     m = SurfaceMaterial.Classify(a.Material, a.NotRect, f.Textured && !f.UseImage, f.SemiTrans && zMode == 2,
-                        f.BlendMode, f.TPage,
+                        f.BlendMode, f.TPage, f.Clut,
                         (int)Math.Min(a.U, Math.Min(b.U, c.U)), (int)Math.Min(a.V, Math.Min(b.V, c.V)),
                         (int)Math.Max(a.U, Math.Max(b.U, c.U)), (int)Math.Max(a.V, Math.Max(b.V, c.V)));
             }
@@ -1085,7 +1097,7 @@ public sealed partial class GlCore : IGpuBackend
                 if (!_kTarget.Geo.PreHud) CopyPreHud(_kTarget);
                 uint tex = VeilTex(f);
                 _kTarget.Geo.Add(VeilVert(a.X, a.Y, a.U, a.V, veil, tex), VeilVert(b.X, b.Y, b.U, b.V, veil, tex),
-                                 VeilVert(c.X, c.Y, c.U, c.V, veil, tex));
+                                 VeilVert(c.X, c.Y, c.U, c.V, veil, tex), TargetClip(_kTarget));
             }
             // 0068. The plane a planar reflection mirrors in is found here, from
             // the water the frame actually drew.
@@ -1104,7 +1116,7 @@ public sealed partial class GlCore : IGpuBackend
                 // no depth -- write no normal either (NormalFs).
                 uint tex = SurfaceTex(f);
                 _kTarget.Geo.Frame(_frame, GteDepth.Generation);
-                _kTarget.Geo.Add(GeoVert(a, gm, tex), GeoVert(b, gm, tex), GeoVert(c, gm, tex));
+                _kTarget.Geo.Add(GeoVert(a, gm, tex), GeoVert(b, gm, tex), GeoVert(c, gm, tex), TargetClip(_kTarget));
             }
         }
         if (lightGen >= 0) _kLightGen = lightGen;
@@ -1155,7 +1167,7 @@ public sealed partial class GlCore : IGpuBackend
         return entry;
     }
 
-    static bool FluidOverlap(int tpage, int u0, int v0, int w, int h)
+    internal static bool FluidOverlap(int tpage, int u0, int v0, int w, int h)
     {
         if (GteDepth.FluidN == 0) return false;
         int mode = (tpage >> 7) & 3;
@@ -1192,6 +1204,17 @@ public sealed partial class GlCore : IGpuBackend
 
     static AoGeometry.V VeilVert(float x, float y, float u, float v, float m, uint tex) =>
         new() { X = x, Y = y, M = m, Tu = u, Tv = v, Tex = tex };
+
+    /// <summary>The batch's draw area in <paramref name="rt"/>'s own 1x pixels,
+    /// inclusive: what the colour pass scissors to, and so what the normal pass
+    /// scissors the batch's kept triangles to. A draw area spanning the game's whole
+    /// width spans the widescreen margin too.</summary>
+    AoGeometry.ClipRect TargetClip(GlDisplayRt rt)
+    {
+        if (rt.Margin > 0 && _kClipX0 <= rt.X && _kClipX1 >= rt.X + rt.W - 1)
+            return new(0, _kClipY0 - rt.Y, rt.Wide1x - 1, _kClipY1 - rt.Y);
+        return new(_kClipX0 - rt.X + rt.Margin, _kClipY0 - rt.Y, _kClipX1 - rt.X + rt.Margin, _kClipY1 - rt.Y);
+    }
 
     /// <summary>0067. A 2D primitive over most of the target is a fade or a flash
     /// the world is seen through, not a piece of the HUD; it is not an overlay.</summary>
@@ -1270,11 +1293,14 @@ public sealed partial class GlCore : IGpuBackend
             else SurfaceMaterial.Overlays += 2;
             if (f.SemiTrans && f.Textured) SurfaceMaterial.TexturedVeils += 2;
             _kTarget!.Geo.Frame(_frame, GteDepth.Generation);
-            uint tex = m == SurfaceMaterial.Overlay ? 0u : VeilTex(f);
+            // An overlay's texel too, so its transparent texels mark nothing (NormalFs):
+            // a letter's box would otherwise cover the veil under it.
+            uint tex = m == SurfaceMaterial.Overlay ? SurfaceTex(f) : VeilTex(f);
+            var clip = TargetClip(_kTarget);
             _kTarget.Geo.Add(VeilVert(a.X, a.Y, a.U, a.V, m, tex), VeilVert(b.X, b.Y, b.U, b.V, m, tex),
-                             VeilVert(c.X, c.Y, c.U, c.V, m, tex));
+                             VeilVert(c.X, c.Y, c.U, c.V, m, tex), clip);
             _kTarget.Geo.Add(VeilVert(b.X, b.Y, b.U, b.V, m, tex), VeilVert(d.X, d.Y, d.U, d.V, m, tex),
-                             VeilVert(c.X, c.Y, c.U, c.V, m, tex));
+                             VeilVert(c.X, c.Y, c.U, c.V, m, tex), clip);
         }
     }
 
@@ -1821,17 +1847,9 @@ public sealed partial class GlCore : IGpuBackend
             _gl.DepthMask(false);
         }
 
-        int clipX0, clipY0, clipX1, clipY1;
-        if (rt == null)
-        {
-            clipX0 = _kClipX0; clipY0 = _kClipY0; clipX1 = _kClipX1; clipY1 = _kClipY1;
-        }
-        else
-        {
-            clipX0 = _kClipX0 - rt.X + rt.Margin; clipY0 = _kClipY0 - rt.Y;
-            clipX1 = _kClipX1 - rt.X + rt.Margin; clipY1 = _kClipY1 - rt.Y;
-            if (rt.Margin > 0 && _kClipX0 <= rt.X && _kClipX1 >= rt.X + rt.W - 1) { clipX0 = 0; clipX1 = rt.Wide1x - 1; }
-        }
+        var (clipX0, clipY0, clipX1, clipY1) = rt == null
+            ? new AoGeometry.ClipRect(_kClipX0, _kClipY0, _kClipX1, _kClipY1)
+            : TargetClip(rt);
 
         int bx0 = (int)Math.Floor(_drawMinX) + (rt == null ? 0 : rt.Margin - rt.X);
         int by0 = (int)Math.Floor(_drawMinY) - (rt == null ? 0 : rt.Y);
@@ -2141,6 +2159,25 @@ public sealed partial class GlCore : IGpuBackend
         if (_legacy)
         {
             _gl.Disable(EnableCap.Blend);
+            DrawTested(rt, zBias, first, _count, true);
+        }
+        else if (_kOpacity != 0 && !(_kTransparent && _kBlend == 2))
+        {
+            // 0126. The port's opacity times the packet's own coverage: an opaque texel
+            // is a * src + (1 - a) * dst; a blended one keeps its mode with its source
+            // scaled by a (half and half is 0.5a and 1 - 0.5a, so at a = 1 it is the
+            // game's). Subtractive packets keep the game's path.
+            float a = _kOpacity / 255f;
+            _gl.Enable(EnableCap.Blend);
+            _gl.BlendFuncSeparate(BlendingFactor.Src1Color, BlendingFactor.Src1Alpha, BlendingFactor.One, BlendingFactor.Zero);
+            _gl.BlendEquation(BlendEquationModeEXT.FuncAdd);
+            if (_kTransparent)
+            {
+                float src = _kBlend switch { 0 => 0.5f, 3 => 0.25f, _ => 1f };
+                SetBlend(src * a, _kBlend == 0 ? 1f - 0.5f * a : 1f);
+            }
+            else SetBlend(a, 1f - a);
+            _gl.Uniform4(_uBlendOpaque, a, a, a, 1f - a);
             DrawTested(rt, zBias, first, _count, true);
         }
         else if (!_kTransparent)
@@ -2794,15 +2831,129 @@ public sealed partial class GlCore : IGpuBackend
         }
 
         uint outTex = ApplyPostFx(_presentTex, fbW, fbH);
+        uint outFbo = outTex == _postTex ? _postFbo : _presentFbo;
+        int outTexW = fbW, outTexH = fbH;
+        // Personal build: the CRT pass runs on the boxed picture too, so it asks for the
+        // box stage itself, with or without the downsample and at a scale of 1.
+        if ((GlVram.Crt || (GlVram.Downsample && presentScale > 1)) && !rgb24 && outW > 0 && outH > 0
+            && Downsample(outTex, presentScale, w1x, h1x, outW, outH))
+            (outTex, outFbo, outTexW, outTexH) = (_dsUpTex, _dsUpFbo, outW, outH);
         EndGpuTimer(compQuery, GpuWork.Composite, compStart, Diagnostics.GpuTimes.Pass.Composite);
         ResolveGpuTimes();
         Diagnostics.GpuTimes.Issued = ++_gpuPresent;
         Diagnostics.Profiler.End(compProfile);
-        if (PresentSnap.Due(dispY)) SnapPresent(outTex == _postTex ? _postFbo : _presentFbo, fbW, fbH, dispX, dispY);
+        if (PresentSnap.Due(dispY)) SnapPresent(outFbo, outTexW, outTexH, dispX, dispY);
 
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         GpuTrace.Sink?.Work(GpuWork.Present, presentStart, System.Diagnostics.Stopwatch.GetTimestamp(), 0);
-        return (outTex, fbW, fbH, aspect);
+        return (outTex, outTexW, outTexH, aspect);
+    }
+
+    /// <summary>0129. The scaled picture boxed down to the game's own pixels and
+    /// brought back up to the size it is drawn at. Without it the Output panel
+    /// shrinks a 1920-line target to the window bilinearly with no mipmaps, which
+    /// reads four texels out of every sixty-four and shimmers on every edge as the
+    /// camera moves. False leaves the picture as it was: the GL 2.1 context has
+    /// no texelFetch, and a program that fails to build is not retried.</summary>
+    unsafe bool Downsample(uint srcTex, int factor, int w1x, int h1x, int outW, int outH)
+    {
+        if (_legacy || _dsFailed) return false;
+        if (_dsBoxProg == 0)
+        {
+            _dsBoxProg = GlShaders.Build(_gl, GlShaders.FullscreenVs, GlShaders.DownsampleBoxFs, "downsample-box", out string? boxError);
+            _dsUpProg = GlShaders.Build(_gl, GlShaders.FullscreenVs, GlShaders.DownsampleUpFs, "downsample-up", out string? upError);
+            if (_dsBoxProg == 0 || _dsUpProg == 0)
+            {
+                Console.WriteLine($"[gpu-ds] {boxError ?? upError}");
+                _dsFailed = true;
+                return false;
+            }
+            _gl.UseProgram(_dsBoxProg);
+            _gl.Uniform1(_gl.GetUniformLocation(_dsBoxProg, "uSrc"), 0);
+            _uDsFactor = _gl.GetUniformLocation(_dsBoxProg, "uFactor");
+            _gl.UseProgram(_dsUpProg);
+            _gl.Uniform1(_gl.GetUniformLocation(_dsUpProg, "uSrc"), 0);
+            _uDsSrcSize = _gl.GetUniformLocation(_dsUpProg, "uSrcSize");
+            _uDsOutSize = _gl.GetUniformLocation(_dsUpProg, "uOutSize");
+            _dsCrtProg = GlShaders.Build(_gl, GlShaders.FullscreenVs, GlShaders.DownsampleCrtFs, "downsample-crt", out string? crtError);
+            if (_dsCrtProg == 0) Console.WriteLine($"[gpu-ds] crt: {crtError}");
+            else
+            {
+                _gl.UseProgram(_dsCrtProg);
+                _gl.Uniform1(_gl.GetUniformLocation(_dsCrtProg, "uSrc"), 0);
+                _uCrtSrcSize = _gl.GetUniformLocation(_dsCrtProg, "uSrcSize");
+                _uCrtOutSize = _gl.GetUniformLocation(_dsCrtProg, "uOutSize");
+            }
+            (_dsBoxTex, _dsBoxFbo) = DownsampleTarget();
+            (_dsUpTex, _dsUpFbo) = DownsampleTarget();
+        }
+        if (w1x != _dsBoxW || h1x != _dsBoxH)
+        {
+            DownsampleResize(_dsBoxTex, _dsBoxFbo, w1x, h1x);
+            (_dsBoxW, _dsBoxH) = (w1x, h1x);
+        }
+        if (outW != _dsUpW || outH != _dsUpH)
+        {
+            DownsampleResize(_dsUpTex, _dsUpFbo, outW, outH);
+            (_dsUpW, _dsUpH) = (outW, outH);
+        }
+
+        // Asked for by the CRT alone: with its program missing there is nothing to run,
+        // and the plain up pass would switch the downsample on behind the setting's back.
+        bool crt = GlVram.Crt && _dsCrtProg != 0;
+        if (!crt && !(GlVram.Downsample && factor > 1)) return false;
+
+        _gl.Disable(EnableCap.DepthTest);
+        _gl.Disable(EnableCap.Blend);
+        _gl.Disable(EnableCap.ScissorTest);
+        _gl.BindVertexArray(_presentVao);
+        _gl.ActiveTexture(TextureUnit.Texture0);
+
+        // The box is the downsample's first stage. With the downsample off, the CRT pass
+        // reads the scaled picture as it is: its scanlines are counted in the game's
+        // lines (uSrcSize below), not in the texels it samples.
+        bool box = GlVram.Downsample && factor > 1;
+        uint input = srcTex;
+        if (box)
+        {
+            _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _dsBoxFbo);
+            _gl.Viewport(0, 0, (uint)w1x, (uint)h1x);
+            _gl.UseProgram(_dsBoxProg);
+            _gl.BindTexture(TextureTarget.Texture2D, srcTex);
+            _gl.Uniform1(_uDsFactor, factor);
+            _gl.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
+            input = _dsBoxTex;
+        }
+
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _dsUpFbo);
+        _gl.Viewport(0, 0, (uint)outW, (uint)outH);
+        _gl.UseProgram(crt ? _dsCrtProg : _dsUpProg);
+        _gl.BindTexture(TextureTarget.Texture2D, input);
+        _gl.Uniform2(crt ? _uCrtSrcSize : _uDsSrcSize, (float)w1x, h1x);
+        _gl.Uniform2(crt ? _uCrtOutSize : _uDsOutSize, (float)outW, outH);
+        _gl.DrawArrays(PrimitiveType.TriangleStrip, 0, 4);
+        return true;
+    }
+
+    (uint tex, uint fbo) DownsampleTarget()
+    {
+        uint tex = _gl.GenTexture();
+        _gl.BindTexture(TextureTarget.Texture2D, tex);
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)GLEnum.Linear);
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)GLEnum.Linear);
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)GLEnum.ClampToEdge);
+        _gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)GLEnum.ClampToEdge);
+        return (tex, _gl.GenFramebuffer());
+    }
+
+    unsafe void DownsampleResize(uint tex, uint fbo, int w, int h)
+    {
+        _gl.BindTexture(TextureTarget.Texture2D, tex);
+        _gl.TexImage2D(TextureTarget.Texture2D, 0, InternalFormat.Rgba8, (uint)w, (uint)h, 0,
+            PixelFormat.Rgba, PixelType.UnsignedByte, null);
+        _gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, tex, 0);
     }
     
     /// <summary>0069. The composited picture, read back for <see cref="PresentSnap"/>.
@@ -3123,17 +3274,20 @@ public sealed partial class GlCore : IGpuBackend
         // (uVeilPass 1), then a textured one's opaque texels as an overlay (2).
         // A veil's texel and a textured surface's both come from sample VRAM.
         var breaks = src.Geo.Breaks;
+        // Each run scissored to the draw area the colour pass drew it in.
+        var clips = src.Geo.Clips;
         _gl.ActiveTexture(TextureUnit.Texture0);
         _gl.BindTexture(TextureTarget.Texture2D, _vram.SampleTexture);
         // 0085. The map's water goes in where the colour pass drew it among the list.
         var water = world && _wnReady ? src.Geo.Water : null;
-        int start = 0, bi = 0, wi = 0;
+        int start = 0, bi = 0, wi = 0, ci = 0;
         int armAt = world && _wnReady ? src.Geo.ArmAt : -1;
         bool veil = false;
         for (;;)
         {
             for (; water != null && wi < water.Count && water[wi].At <= start; wi++)
             {
+                _gl.Disable(EnableCap.ScissorTest);
                 if (src.Surface != 0) _gl.Disable(EnableCap.Blend, 1);
                 _gl.BlendFunc(BlendingFactor.One, BlendingFactor.OneMinusSrcAlpha);
                 DrawWorldWaterNormals(water[wi].Lo, water[wi].Hi);
@@ -3147,6 +3301,7 @@ public sealed partial class GlCore : IGpuBackend
             if (armAt >= 0 && armAt <= start)
             {
                 armAt = -1;
+                _gl.Disable(EnableCap.ScissorTest);
                 if (src.Surface != 0) _gl.Disable(EnableCap.Blend, 1);
                 _gl.BlendFunc(BlendingFactor.One, BlendingFactor.OneMinusSrcAlpha);
                 DrawArmNormals(src);
@@ -3162,6 +3317,10 @@ public sealed partial class GlCore : IGpuBackend
             if (bi < breaks.Count) end = Math.Min(end, breaks[bi]);
             if (water != null && wi < water.Count) end = Math.Min(end, water[wi].At);
             if (armAt > start) end = Math.Min(end, armAt);
+            for (; ci + 1 < clips.Count && clips[ci + 1].At <= start; ci++) { }
+            if (ci + 1 < clips.Count) end = Math.Min(end, clips[ci + 1].At);
+            if (ci < clips.Count) ScissorRun(clips[ci].Rect, scale);
+            else _gl.Disable(EnableCap.ScissorTest);
             if (veil)
             {
                 if (src.Surface != 0) _gl.Enable(EnableCap.Blend, 1);
@@ -3176,11 +3335,21 @@ public sealed partial class GlCore : IGpuBackend
             start = end;
         }
         _gl.BindBuffer(BufferTargetARB.ArrayBuffer, 0);
+        _gl.Disable(EnableCap.ScissorTest);
         _gl.Disable(EnableCap.Blend);
         if (world && _uNrmDepthCull >= 0) _gl.Uniform1(_uNrmDepthCull, 0);
         if (RetainedScene.SurfaceCheck && src.Surface != 0) CheckSurfaces(src);
         AoGeometry.Passes++;
         return true;
+    }
+
+    /// <summary>The normal pass's scissor for a run of kept triangles: their draw
+    /// area at the normal target's scale.</summary>
+    void ScissorRun(AoGeometry.ClipRect r, int scale)
+    {
+        _gl.Enable(EnableCap.ScissorTest);
+        _gl.Scissor(r.X0 * scale, r.Y0 * scale,
+            (uint)Math.Max(0, (r.X1 - r.X0 + 1) * scale), (uint)Math.Max(0, (r.Y1 - r.Y0 + 1) * scale));
     }
 
     /// <summary>0067. Whether a reflection pass can run: the setting, the program,

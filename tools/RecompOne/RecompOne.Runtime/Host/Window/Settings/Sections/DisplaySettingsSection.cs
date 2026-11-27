@@ -59,6 +59,24 @@ internal sealed class DisplaySettingsSection : ISettingsSection
             ImGui.TextDisabled(Localization.T("settings.display.render_scale_lines",
                 width, lines, width * scale, lines * scale, scale));
 
+        var downsample = Hle.GlVram.Downsample;
+        if (ImGui.Checkbox(Localization.T("settings.display.downsample"), ref downsample))
+        {
+            ConfigManager.View.Downsample = downsample;
+            ConfigManager.SaveView(PanelManager.Panels);
+            Hle.GlVram.Downsample = downsample;
+        }
+
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Localization.T("settings.display.downsample_hint"));
+
+        var crt = Hle.GlVram.Crt;
+        if (ImGui.Checkbox("CRT (fakelottes-kris)", ref crt))
+        {
+            ConfigManager.View.Crt = crt;
+            ConfigManager.SaveView(PanelManager.Panels);
+            Hle.GlVram.Crt = crt;
+        }
+
         // How big the picture is drawn, and how wide it is presented, are the same
         // kind of choice, so a port offering an aspect ratio has somewhere to put it
         // that is not a group appended below the whole section.

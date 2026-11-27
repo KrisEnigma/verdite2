@@ -1106,6 +1106,33 @@ and 71.6-71.8 after (GPU-bound), 19.9 ticks/s both. GL 4.5 and 2.1 both compile,
 link and reach an area with `KF2_GLDEBUG=1` reporting no errors, and the picture
 was checked by eye on it after both.
 
+## A model behind a wall
+
+The bury test (`uOtzBury` in PrimFs) writes a wall's depth over a model fragment that sits behind the map, when the ray from the eye through the model's origin hits the map behind that origin. That keeps an open chest lid, which hangs inside its own wall's tile, from vanishing into the wall. It also pulled a corner plant's leaf, whose tip sticks round the corner, onto the wall in front of it.
+
+The origin's distance in front of the wall's plane tells the two apart. An open lid's hinge sits 384 to 512 units in front of the wall it swings into. The plant sits 0 to 64 from its face. A secret door sits 257 behind its wall. The pull now needs the origin more than 256 units in front of the plane. The plane is rebuilt from the map's own depth around the pixel, two game pixels out, and each axis takes the side that stays on that face.
+
+Doors and secret walls are flagged (`ModelInstance.Door`) and never pulled, since they slide inside the wall they sit in. `gpuworld bury off` puts the test back to the old behaviour. The plant, the lid, the barrel and the secret wall were checked by eye.
+
+The map behind the origin is read where the origin lands on screen. A lid at the edge of view has its hinge past the edge, where a fetch from the depth copy is 0, and the lid lost its wall again until the hinge came back into view. The read is clamped to the screen's edge (`0127`), and so are the plane's neighbours, two game pixels either side; a side clamped back onto the pixel is skipped for the other, and with no plane there is no pull.
+
+Tried and removed on the way:
+- Scaling a whole model's depth towards the eye clipped the lid mid-swing and showed the barrel in the next room through its wall.
+- A cap on how far a fragment may be pulled, replaced by the distance and plane rules above.
+- Averaging each face's depth (a face-order pass, the console's ordering by polygon) drew the chest's bottom with the floor showing through it in thin lines, and then cut wedges into the stairs: a hidden riser's corners averaged nearer than the tread in front of it. A tie-break fixed one view and not the next, so the pass was taken out.
+
+## A picked-up item inside its barrel
+
+A picked-up item flies up from where it lay, at the barrel's or the chest's depth. The console's table slot puts it in front; the depth test left the mask half inside its barrel and the shield inside its chest. `ModelInstance.Front` (`0128`), set by KF2 for a pickup and the menu preview, draws the item after the others with its depth at half its view depth.
+
+The first version forced the depth test to pass. The item came out, but its faces no longer hid one another and drew in the order they were sent: from behind, the board covered the shield's grip except its two mounts, and from the front the grip showed through the board, so the grip looked as if it did not turn with the shield. The normal pass still saw the chest behind the shield, so the occlusion drew the chest's edge on it and darkened its top. A scale keeps the faces testing each other, and the normal pass now draws a front item last, over the world. Checked by eye: the mask looking down at its barrel, the shield through its turn.
+
+## A face's texels truncate down
+
+The centre tap used to round towards the texel the gradient enters from, the sign of dU/dx for U and of dV/dy for V. A console polygon's mapping is affine, so that sign is one per polygon. A perspective-correct one is not: on the first stairs seen from the side, the sign changed inside the step, and the texture slipped a texel along a line that moved with the camera. Taking the sign from the affine gradient moved the flip, it did not remove it. A face whose V runs across the screen had dV/dy of 0.0003, so its sign was noise. A long riser's two halves disagreed along the diagonal.
+
+Any direction read off the gradient flips at some camera angle, so a face with a depth always takes `floor`. That rule reached `main` from the RecompOne fork first, as the 2026-10-22 amendment to `0009` (KF1's and Verdite3's floors, the same seam), so #93's own version of it (`0114`, with an affine face's direction taken from both axes) was dropped when the branch was rebased, and the fork's per-axis rule kept. The stairs measurement, 0 texel jumps strafing up to 16 units either side against 42 changed blocks before, was made on #93's version; for a perspective-correct face the two give the same `floor`, but it has not been re-run on the fork's.
+
 ## PGXP: upstream's own recovery, and what taking it actually bought
 
 **Mechanism confirmed and measured; the picture has not been looked at.**
@@ -3918,6 +3945,36 @@ the world behind it.
 The mechanism is `tools/RecompOne/patches/0039`. GL backend only: the software
 rasterizer has a 1x VRAM and nothing to preserve.
 
+## Downsampling: the render scale as antialiasing, not as resolution
+
+**Measured mechanism; how it looks in motion is the player's to judge.**
+
+Reported from play: *the picture does not look as good as RetroArch's.* The
+RetroArch setup it was compared with runs DuckStation at 8x with
+`GPU.DownsampleMode=Box`: the core renders at 1920 lines and averages each 8x8
+block back to one of the console's 240 before anything is drawn to the screen.
+Here the 8x target went to the window as it was, through the Output panel's
+bilinear sampler with no mipmaps. On a 2160-line screen that stretches 1920 lines
+to 2160, and every polygon edge, drawn with one sample per pixel, comes out a
+hard step smeared by the stretch; on a smaller window it shrinks instead, reading
+four texels of each 8x8 block, and the edges shimmer as the camera turns.
+
+**DOWNSAMPLE** under DISPLAY (`KF2_DOWNSAMPLE=1`; the runtime's `Downsample`
+key, so Settings ▸ Display has it too) does what DuckStation does: the present
+averages each block into a picture of the game's own size (428x240 at 16:9, the
+margin included), then scales that to the window with sharp bilinear, so the
+pixels are even squares at whatever size the window is and only the band between
+two of them is blended. The render scale stops being sharpness and becomes the
+number of samples per game pixel: at 8x, 64 of them, so an edge is a true
+coverage blend and a texture's distant texels are averaged rather than picked.
+The HUD and the text go through the same average, so they come back on the
+console's own pixel grid too. Dimmed at 240P, where a block is one sample.
+
+Measured at 8x on a 3840x2160 fullscreen: the snap is 3840x2160, 9x9 squares of a
+428x240 picture, against the 3424x1920 target with the setting off. The
+mechanism is `tools/RecompOne/patches/0129`. GL 3.3 and up; the 2.1 context
+keeps the plain present.
+
 ## A shop overwrote the textures with the atlas's old texels
 
 **Fixed; confirmed by eye in the shop.** Reported from play: after opening and
@@ -4430,6 +4487,35 @@ still, how it reads on a surface up to 338 off the plane it is mirrored in (the
 lookup is at the pixel, so a crest shifts its reflection a little, which should read
 as the wave), and whether the wider tolerance lets a surface near the water that is
 not on it take the mirror.
+
+### Lava is not water
+
+The lava rippled, swelled, murked and reflected like the water, because it is drawn
+from the water's own texture. The eight scrolling slots at `0x80192D58` hold the
+same five dest rects in every area, and a dump of the faces that sample them (the
+swell's map meshes, headless, each face's texels averaged through its own CLUT)
+found the water and the lava on one rect, tpage `0x015`, UVs 0,0-63,62, in the same
+averaging blend (command `0x26`, blend 0), told apart only by the palette: clut
+`0x7C98`, the water, at 0.29 0.36 0.48, and clut `0x7DD8`, the lava, at 0.82 0.31
+0.10. A rect, the blend and the page were the whole test of water, so the lava
+passed all three.
+
+So a water rect is water only through a **cool palette**:
+`SurfaceMaterial.CoolPalette` (RecompOne `0130`) sums the palette's entries (all
+sixteen of a 4-bit one, every sixteenth of an 8-bit one, transparent 0 left out) and
+takes it as water when blue is at least red. `Reflections.ReadRects` marks its rects
+`CoolOnly`, and every test of water asks it: `SurfaceMaterial.Classify` (the surface
+buffer, so the march, `Murk` and the planar walk's plane), `PrimFs`'s ripples
+(`coolPalette`, the same sum in the shader), the swell's mesh (`WaterSwell.IsWater`),
+the GPU world's `FlagWater` (`RetainedMap.SurfaceWater`), its planes
+(`RetainedPlanes`), and a model's water (`ModelWater`, `RetainedModels`). The
+scroll's smoothing (`FluidSmoothing`) is left on the lava: it scrolls too.
+
+Measured headless from slot 2, warping area by area: the swell's water positions in
+fdat14 go from 652 to 0 and in fdat20 from 508 to 0, while fdat02 keeps 5174 and
+fdat05 133. `PrimFs` compiles under `glslangValidator`. The GL half (the ripples on
+the lava, the reflection and murk there) cannot run headless and is **not judged by
+eye**; nor is whether every lava face in those areas is now plain.
 
 ## The reflections see past the camera's cull
 

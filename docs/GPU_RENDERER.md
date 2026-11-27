@@ -537,6 +537,33 @@ fps drawn at 20.0 ticks/s. `KF2_GPUWORLD_FOGZ=0` is the comparison.
 **Not checked:** the fog fix by eye, and whether it is known issue 2's wedge; the
 fluid scroll on an opaque face.
 
+**At the corners, a wall beside the camera fogged to black (2026-11-12).** Reported
+from play: up close to a wall, its near part was black, cut along a slanted line. The
+fix above runs only while `MainFogFromZ` is on, which is fog by depth or by distance;
+with PORT SETTINGS ▸ WORLD ▸ FOG at the corners (the dev store had `kf2.fog=0`), the
+GPU map is fogged from the corners' screen-affine `vFog` again, and a corner behind the
+eye carries the cue's saturated end into the face's visible part. `WorldVs` now marks
+a corner nearer than the near plane (`vClipped`), and at the corners `PrimFs` fogs a
+face it marks at the pixel's own depth; a face wholly in front keeps the game's corner
+fog. `gpuworld at X Y` now cuts each triangle at the near plane before testing the
+pixel, so it finds a face reaching past the eye (it skipped any triangle with a corner
+behind, which is how it missed this wall).
+
+Measured: area 1 (`KF2_AUTOSTART=2`), the camera put by `view` 20-700 units from the
+wall at z = 73984, x = 72700, eye height, level, five headings; share of near-black
+pixels in the presented picture (`snap`):
+
+| distance | corners, before | corners, after | depth | distance (default) | `gpuworld off` |
+|---|---|---|---|---|---|
+| 700 | 0.00-0.38 | 0 | 0 | 0 | 0 |
+| 160 | 0.34-0.79 | 0 | 0 | 0 | 0 |
+| 40 | (not taken) | 0 | (not taken) | (not taken) | 0.23-0.44 |
+| 20 | (not taken) | 0-0.13 | (not taken) | 0-0.13 | 0.33-0.79 |
+
+What is left at 20 units is the GPU map's near plane (`KF2_GPUWORLD_NEAR`, 16), the
+same in every mode, and the packets lose more there. **Not judged by eye**, and whether
+the player's own collision lets the eye that near a wall is not measured.
+
 #### Step 2, the third slice
 
 **The map's water drawn on the GPU, in the table's order. Mechanism measured; not
@@ -1902,3 +1929,160 @@ it runs only when the map's hash changes. `KF2_FPS=144 KF2_FPS_PROBE=1` after it
 144.0 fps drawn at 14.9-15.0 ticks/s.
 
 **Mechanism measured over every area's mesh; the picture not judged.**
+
+## A rebuild for a half that draws nothing (2026-11-11)
+
+**The random hitch in play was a whole map rebuild.** Three saved profiles
+(`Shift+P`, area 1 from slot 2) held 67-74 ms frames every few seconds with no menu
+open, each with 24-28 MB allocated and 57-59 ms booked to `replace
+TileWalk.ReplaceWalk`, often in pairs on two consecutive frames. Normal play otherwise
+runs at 8.3 ms with no other frame above 12 ms. The tile walk is where
+`RetainedMap.AtWalk` runs, and a build of area 1's 67,501 triangles now costs 55-70 ms
+(the hairline merge above included; it was 11.8 ms before that).
+
+**What changed the hash.** `KF2_GPUWORLD_PROBE=1` with a diff of the live map behind
+each `map` build, while the shell's `goto` moved the player round the area: every build
+after the load came from upper halves of model `0xFE`, in 3x3 blocks, whose `+2` went
+`00` to `03` or `01` to `00`. These are an object's footprint written over the tiles
+it stands on (see "The rewrite census" in `REMASTER.md`), and the low two bits of `+2`
+are the turn, which `MeshBytes` hashes. A model of 240 or more draws nothing (the
+builder, the tile walk and the swell all skip it), so the write changed nothing that
+is drawn. `WaterSwell.Hash` reads the same bits, so its own rebuild followed. Its
+`Generation` is part of the map's extra hash, so the map rebuilt a second time on the
+next frame. That is the pair.
+
+**The fix.** `RetainedMap.HalfKey` is one value (`0xFF`) for a half of model 240 or
+more, whatever its other bytes hold, and both hashes read it. A half that becomes
+drawable still changes the hash. Measured with the same `goto` roam (40 moves over 50 s):
+before, 3 rebuilds after the load's two; after, none. `KF2_FPS=144 KF2_FPS_PROBE=1`:
+140-144 fps drawn at 14.9 ticks/s.
+
+**Still a rebuild:** a rewrite of a drawn half (a door, the drawbridge, a lift) cost a
+whole build of 55-70 ms. The next section makes it a patch. The two menu-transition
+spikes in the first profile (48 and 72 ms, 14-22 MB, booked to the menu loop's own
+time) are not explained by this and were not reproduced.
+
+**Mechanism measured; the hitch's absence in play not yet confirmed by the player.**
+
+## Only the cells near a change are rebuilt (2026-11-11)
+
+**A rewrite of drawn halves patches the map instead of building it whole.** A whole
+build of area 1 is 64-76 ms: the faces 12-14 ms, the weld (the 45-degree slides and
+the seam merge) 37-50 ms, `SetStatic` 7-9 ms. A door touches a few cells of 6,400.
+
+- **The map is kept by half.** The build walks the halves in a fixed order (`(tz * 80 +
+  tx) * 2 + half`) and records where each half's corners begin (`_halfStart`), with each
+  plane-shaped face for `RetainedPlanes` kept the same way (`PlaneNote`, replayed into
+  the planes at every publish). Each half's `HalfKey` at the build is kept too.
+- **A patch** runs when only the halves changed: the bank, the materials, the water's
+  rects, the swell's free set and the switches all as they were at the last build
+  (`_builtRest`), the lights not a rebuild, at most 600 changed cells. The cells within
+  one of a changed half (`PatchReach`) are rebuilt, since EvenFog's blends read the
+  neighbours' records and the weld and the merge move corners the next cell's mesh
+  shares. The cells within two are built past the kept corners so that the slides and
+  the merge see what a whole build sees there. The inner cells' halves are spliced into
+  a spare buffer in the build's order and the rest copied (`Splice`), then published as
+  before. Anything else, a load included, is a whole build.
+- **The swell no longer forces a second build.** The map hashed the swell's
+  `Generation`, which every swell build bumps, and the swell hashes the drawn halves
+  too, so a door anywhere was a patch and then a whole build on the next frame. The map
+  now hashes `WaterSwell.FreeHash`, the free set itself, so it rebuilds only when the
+  swell's answer for its corners changed.
+
+**Measured** (area 1 from slot 2, with a temporary switch that flipped the height of 9
+drawn halves near the player every 2 s; not committed): `KF2_GPUWORLD_MAPCHECK=1`
+builds the whole map after each patch and compares every corner's bytes in the build's
+order. Every patch matched: 202,503 corners and 48,711 plane notes. Without the check,
+a patch of 9 changed cells is 7.4-9.8 ms: faces 0.5-1.0, weld 1.1-1.7, `SetStatic`
+3.6-4.2, the rest the hash, the splice's copy (14 MB) and the keys. The whole builds at
+load are unchanged. `KF2_FPS=144 KF2_FPS_PROBE=1`: 140-144 fps drawn at 14.9-15.0
+ticks/s, as before the change.
+
+**What is left of the cost.** `SetStatic` still sorted and the backend still uploaded
+the whole map on the next frame. The next section patches both by chunk.
+
+**Mechanism measured; a real door in play not watched, and the hitch's absence not
+yet confirmed by the player.**
+
+## The scene is patched by chunk too (2026-11-11)
+
+**A patch now reaches the GPU as the chunks it changed** (RecompOne `0124`).
+`RetainedScene` lays the static map out with spare room after each (range, chunk)
+slot, filled with degenerate triangles. `RetainedMap.Patch` marks the chunks its
+region's cells lie in (a triangle's chunk is its centre's) and publishes through
+`RetainedScene.PatchStatic`, which rewrites those chunks, and any whose count moved,
+in place. It falls back to a whole layout when a slot outgrows its room. The backend
+sends only the rewritten ranges; the texture keys are refreshed over them; the water's
+centres and the shadows' cubemaps follow any change.
+
+The probe's build line says `scene by chunk` or `scene whole`, and
+`KF2_GPUWORLD_MAPCHECK=1` now also lays the patched map out whole and compares every
+slot and chunk (`scene's chunks match`). Two readers of the whole span read slot by
+slot now, since a range's span holds the padding: `gpuworld at` and the retained
+probe's triangle count.
+
+**Measured** (area 1 from slot 2, nine drawn halves flipped near the player every
+2 s by a temporary switch, not committed):
+
+| | whole | patch |
+|---|---|---|
+| map build (game thread) | 64-74 ms | 4.7-8.2 ms |
+| of which the scene (`SetStatic`/`PatchStatic`) | 7-10 ms | 1.1-1.7 ms |
+| upload on the next frame (`UploadStatic`) | 3.6-5.1 ms | 0.01-0.14 ms |
+| texture keys on the next frame | 3.0-4.8 ms | 0.9-1.6 ms |
+
+Every patch matched a whole build and a whole layout. The picture hash (`snap hash`,
+paused, at three `goto` spots) is identical to the build before this change.
+`KF2_GLDEBUG=1 KF2_FPS=144 KF2_FPS_PROBE=1`, roaming: 144.0 fps drawn at 14.9-15.0
+ticks/s, no GL error, `[present] wide 288`.
+
+**What is left:** about 2-3 ms of a patch is not in its three parts. That is the hash,
+the splice's copy of the whole corner array and the key pass, all over the whole map.
+A door also redraws the authored lights' shadow cubemaps, as any change to the map
+did before.
+
+**Mechanism measured; a real door in play not watched, and the hitch's absence not
+yet confirmed by the player.**
+
+## The last area's meshes on this one's tiles (2026-11-17)
+
+A player reported the map "breaking" on walking back from the second area to the
+first: floating blocks, walls missing, stars where a ceiling should be. It persisted
+past a new game, because it happens on every walk across a boundary, and never on a
+`warp` or a save load, which is why no run here had seen it.
+
+**A walk and a warp load differently.** A warp or a load is `func_80024154`: the
+loading screen, a blocking wait, everything in RAM before the next walk. A walk is a
+crossing object (state `0xE0`, the target area at `rec+0x3A`) calling the resource
+request `0x800162DC`, and the loader `func_8001689C` streams the request in across
+frames while the game runs. Its state: the five resource ids loaded at
+`0x8017E060-64`, the ids pending at `0x8017E06C-70`, a busy u16 at `0x8017E05C`.
+Area 0's crossings sit in pairs in the tunnel, obj 1 at (159744, 104448) to area 1
+and obj 3 at (159744, 94208) back to area 0; area 1's exit to area 0 is obj 48 at
+(26624, 67584).
+
+**The layout lands before the meshes.** Walking area 1 into area 0 (`goto 27648
+-8704 68608` from slot 2), the map block took area 0's layout 185 ms after the
+module, and the mesh bank changed about 40 ms later, both while the loader was
+busy. The bank is at `0x8012E9AC` in every area, so the map's rebuild key, which
+hashes the tile keys and the bank's *pointer*, saw the layout change and not the
+bank: a whole build of area 0's tiles with area 1's meshes, **115,762 triangles
+against the real 48,837**, then a patch of the one cell that changed later, and
+nothing after. The game's own path reads the meshes at draw time, so the kept map
+stayed wrong only in the GPU world (`GpuWorld`, on by default), until the next whole
+build: the next warp or load. The other
+direction was wrong as well (71,218 against 67,501).
+
+**The fix:** `RetainedMap.AtLoaderIdle` watches the busy word, and when the loader
+goes idle compares a hash of the bank (the 240 model headers and each model's
+vertices) with the one the map was built from; a difference is a whole build, and
+the models' meshes are dropped (`RetainedModels.ForgetMeshes`) on the same edge, as
+an overlay load already did. Measured on the same crossings: 1→0 ends at 48,837,
+0→1 at 67,501, each settled 600-650 ms after the module with one extra whole build
+(37-59 ms) per crossing.
+
+**What is left:** the picture is still wrong for the half second the loader is
+streaming (the build at the layout's change is still made). The crossings are in
+tunnels and the game's own picture is mid-load then too. A report of mismatched
+*textures* at a crossing, and the noclip route that showed the same, were not
+reproduced. **Mechanism measured; the reporter's picture not yet confirmed fixed.**

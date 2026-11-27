@@ -1242,9 +1242,10 @@ So:
   and base magic. They are what a level-up raises, they are what the save carries,
   and nothing recomputes them.
 - **`STR POWER`, `MAG POWER` and the seventeen ratings are derived**, rebuilt from
-  the equipment every time `func_800244CC` runs. Twelve sites call it: equip and
-  unequip (`func_80024B7C`, `func_80024C14`), item use (`func_80025FD0`,
-  `func_80026210`, `func_8002658C` twice), the level-up (`func_80024CAC`), the
+  the equipment every time `func_800244CC` runs. Twelve sites call it: two counters'
+  carries (`func_80024B7C`, `func_80024C14`; not equip and unequip, see "Equipping a
+  weapon or an attack spell, and an item's model"), item use (`func_80025FD0`,
+  `func_8002658C` twice), the weapon equip (`func_80026210`), the level-up (`func_80024CAC`), the
   post-load fixup (`func_800240B8`), the new-game setup (`func_800253F0`), the
   status screen's own opener (`func_800197D4`), and **four sites inside stage 3**.
 
@@ -1794,6 +1795,76 @@ model the game's view admitted: 1.4 million lookups in 12 fuzz runs, 0 disagreem
 **Not reproduced at the reporter's spot**: the shell's `warp 6` and `goto` there did
 not settle into `fdat20`, and their RAM dump was not attached. The fix is from the
 same routine and the same stale-slot shape.
+
+A crash with the same signature inside the game's own view had another cause: see the
+next section.
+
+### A walked crossing's objects came from a texture
+
+Reported 2026-11-25 by a player at 0.6.1: `unmapped address: 0x3B2E13F4` in
+`func_80017764` under `func_80032CD8` from `ModelWalk.Ordinary`, about a second after
+`fdat08` loaded over `fdat05` (walking area 1 into area 2). Fuzz seed 1024 had read the
+same address after a `goto` onto that exit, with the walk recompiled too, and was put
+down to the macro. It is not the macro's, and not a stale slot: the whole object table was
+garbage (162 of 349 records with model ids past `0x140`, every creature descriptor
+unloaded), so the model lookup was only the first routine to touch it. With the lookup
+guarded, the run crashed next in `func_8003B9EC` under stage 4.
+
+**The loader's buffer is shared.** A walk streams the next area in
+(`func_8001689C`, steps at `u16[0x8017E05E]`, `0xF0` while a read is in flight). Steps 0
+and 2 read `FDAT.T` entries `3a` (the map) and `3a+1` (descriptors, creatures, objects)
+into `0x801B6FA8`. The read's callback sets the next step, and that step copies the
+buffer out on the loader's next call. The texture loader (the queue's type `0x30`
+requests, callback `0x80014410`) reads a picture's second part into the same buffer: after
+the first part it rewrites its own slot to `dst 0x801B6FA8`, the next sectors, and
+state 0.
+
+**Instant reads let the texture win.** The queue (`func_8001794C`, one slot a call, run
+from each vblank callback) served, inside one frame of seed 1024: entry 7 (14 sectors
+from LBA 545, correct, step set to 3), a model (26 sectors), a palette (2 sectors from
+LBA 7926), and that palette's second part, 18 sectors from LBA 7928 into `0x801B6FA8`.
+The loader then ran step 3 on the picture's bytes; the buffer's first word read 0 where
+`FDAT.T` entry 7 starts with `0x32C0`. On the console each read takes tens of
+milliseconds, so the loader runs its step long before the texture gets there. In the
+port every read completes at once, and several vblanks inside one frame (turbo; a hitch
+in real play, such as a cold overlay's first frames) serve the whole chain before stage 7
+runs.
+
+**The fix** (`patches/StreamGuard.cs`): when the queue retires a loader read into the
+buffer (a slot with `dst 0x801B6FA8` and a callback in `0x80016800..0x80017000`, the call
+that moves the step off `0xF0`), the 0x11000 bytes are kept, and if they have changed when
+the loader runs that step, they are put back first. The texture's part was already
+handled in its own callback; one not yet checked fails the queue's checksum
+(`func_80017DB0`) and is read again, which is the game's own retry. **Holding the queue
+instead deadlocked**: a second crossing object waits in stage 2 (`func_800162DC` ->
+`func_80017818`, a VSync loop) for the queue to drain, while the loader waits for stage 7.
+Deferring `LibCd.CdRead`'s completion callback to the next tick did not help either, since
+the queue checks completion by itself.
+
+**Measured:** seed 1024 at 20000 frames crashes with `KF2_STREAMGUARD=0` (the player's
+stack, `func_80017764 > func_80032CD8 > ModelWalk.Ordinary > WalkObjects`) and plays
+clean with the guard: area 2 loaded (`22222`), objects sane, and the walk back to area 1.
+The guard put back 36,848 bytes before step 3. Seeds 1000-1035: 36 of 36 clean; it fired
+in seed 1024 only. **Not reproduced on the player's machine**: their RAM dump was not
+attached. The crash signature, overlay and loader state match seed 1024.
+
+**Watching for the class** (`patches/DiscRace.cs`). The fault is not this buffer's: it
+is that the port's drive finishes a read at once, and a hitch delivers several vblanks
+in one frame, so a read can land on RAM another requester read into before it copied the
+data out. The console's drive never allowed that. Most requesters use their read in its
+callback, which the queue runs before it starts the next read, so nothing can race
+them. A *deferred consumer* only marks its read ready in the callback and copies it out
+later. `DiscRace.DeferredConsumers` lists them by their callbacks; today that is the
+area loader's five step callbacks, and not its type `0x40` stream (callback
+`0x80016F50`), which the queue uses chunk by chunk itself. A read by anyone else over a
+deferred consumer's live read is a race. With a guard that repairs it, the race counts
+as handled; any other is logged (`[KF2] disc race:`) and is a fuzz violation
+(`disc-race`). In 48 fuzz runs with the guards on it found exactly the one race the stream guard
+repaired. With `KF2_STREAMGUARD=0` it flags seed 1024 before the crash; it then falls back
+to clearing live reads at frame boundaries, which also flags the blocking loads, so that
+mode is for comparison only. A raw rule ("two requesters over the same RAM in one frame")
+found no shared RAM at all other than `0x801B6FA8`, and no deferred consumer other than
+the loader. A newly found one is a new row.
 
 ### `func_8002C3A8` is the floor-height query
 
@@ -2453,6 +2524,26 @@ target, or redraw with stage 13 as `LoopPacing` does. The text: a replacement pe
 (file, entry), drawn where quads 3-4 go. Nothing in the runtime draws a port
 texture into the GL frame; the map draws through ImGui over `OutputView`, which only
 blends by alpha, so a replacement there would be pre-composited.
+
+## Equipping a weapon or an attack spell, and an item's model
+
+Read 2026-11-11 for the Shortcuts hands (PATCHES_AND_MODS, "Shortcuts"); the weapon
+equip run outside the menu and measured, the rest read statically.
+
+| routine | what |
+|---|---|
+| `func_80026210(id)` | **the weapon equip**: `u8 0x801994AF = id`, the record `0x80199494 = 0x801B7FBC + id * 0x44`, the weapon's model read from disc into `*0x80199498` (`func_800183A0(5, id + 0x31, …)`) and set as model `0x20` (`func_800347EC`), the swing clock `0x801994A4 = -1`, then the stats (`func_800244CC`). Called by the weapon page `func_8001A6E8` (return `0x8001AA4C`), `func_800240B8` and the death reset `func_80025B4C`. Inventory counts are untouched: an equipped weapon stays in `0x8009B52C` |
+| `0x80025F70(id)` | **the attack spell setter**, one store, `u8 0x801994AB = id`. The signature merge named it `SsSetAutoKeyOffMode` (a 16-byte false match); the attack magic page `func_8001AB48` calls it from `0x8001AD68`, unless the pick was -1 |
+| `func_80024B7C`, `func_80024C14` | **not** equip and unequip: each bumps a counter (`0x80199434` / `0x80199436`) and, when it reaches 100, zeroes it and raises another (`0x80199438` / `0x8019943A`, held at 999), plays sound `0x1F` / `0x20` and rebuilds the stats. The docs' earlier "equip and unequip" was a guess from the stat rebuild |
+| `func_80022CAC(item)` | the preview's load: `func_80017F1C(6, item, 0)` the entry's size, `func_800177D0` a block of the model heap, `func_800183A0(6, item, dst)` the read, `func_8002E5E8(3, dst)` into bank 3 |
+| `func_8002E5E8(bank, tmd)` | `0x8018E18C[bank] = tmd`, the current model `0x8018E19C = tmd`, then `func_8002E314(tmd)`, which fixes the TMD's packets up in place once (texture coordinates and the like shifted by 3) |
+| `func_8002E1BC(i)` | object *i* of the current model: `cur + 0xC + i * 28` (a TMD object: vertex offset, count, ...); `func_8002E1F0(i)` points the vertex base `0x8018EAA0` at its vertices |
+
+So **an item's model is entry *id* of disc file 6, a plain TMD**, and any of them can be
+drawn without the heap or a bank: read it anywhere, fix it up once, and point
+`0x8018E19C` at it for the draw. The HUD builder draws its records exactly that way
+(the light record, the matrices, `func_8002E910` without perspective,
+`func_8002F214(0, 0)`), apart from the MO blend a static model does not need.
 
 ## The bow and the arbalest
 
